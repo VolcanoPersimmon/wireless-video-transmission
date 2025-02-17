@@ -1,5 +1,6 @@
 #include <iostream>
 extern "C" {
+#include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/dict.h>
 #include <libavdevice/avdevice.h>
@@ -45,6 +46,27 @@ int main() {
         return -1;
     }
 
-    std::cout << "摄像头打开成功！" << std::endl;
+
+    //查找h264编码器
+    const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_H264);
+    if (!codec) {
+        std::cerr << "Codec not found" << std::endl;
+        return -1;
+    }
+    //创建编码器上下文
+    AVCodecContext* codec_ctx = avcodec_alloc_context3(codec);
+    if(!codec_ctx) {
+        std::cerr << "Could not allocate video codec context!" << std::endl;
+        return -1;
+    }
+    codec_ctx->width = 1280;
+    codec_ctx->height = 720;
+    codec_ctx->time_base = (AVRational){1, 30}; // 帧率30fps
+    codec_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+    codec_ctx->bit_rate = 4000000; // 4 Mbps
+    if (avcodec_open2(codec_ctx, codec, NULL) < 0) {
+        std::cerr << "无法打开编码器！" << std::endl;
+        return -1;
+    }
     return 0;
 }
