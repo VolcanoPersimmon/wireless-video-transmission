@@ -164,6 +164,8 @@ int main() {
         return 1;
     }
 
+    
+
     // 9. 进入采集循环（示例采集 100 帧）
     for (int i = 0; i < 100; i++) {
         struct v4l2_buffer buf;

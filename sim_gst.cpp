@@ -11,11 +11,18 @@ std::queue<std::vector<unsigned char>> bufferQueue;
 std::mutex bufferMutex;
 std::condition_variable bufferCond;
 
+
 // 向队列中添加数据
 void push_data(const std::vector<unsigned char>& data) {
     std::lock_guard<std::mutex> lock(bufferMutex);
+    // if (bufferQueue.size() >= 100) {
+    //     bufferCond.wait(lock, [] { return bufferQueue.size() < 100; });
+    // }
     bufferQueue.push(data);
+    std::cout << "Queue size: " << bufferQueue.size() << std::endl;
     bufferCond.notify_one();
+    // std::this_thread::sleep_for(std::chrono::milliseconds(33)); // 模拟 30FPS
+
 }
 
 // 从队列中取数据
@@ -24,11 +31,15 @@ std::vector<unsigned char> pop_data() {
     bufferCond.wait(lock, [] { return !bufferQueue.empty(); });
     auto data = bufferQueue.front();
     bufferQueue.pop();
+    // bufferCond.notify_one(); 
     return data;
 }
 
 // 编码回调函数：从 appsink 获取编码后的数据
 static GstFlowReturn new_sample_callback(GstElement *sink, gpointer user_data) {
+    auto now = std::chrono::high_resolution_clock::now();
+    static auto last_time = now;
+    
     GstSample *sample;
     GstBuffer *buffer;
     GstMapInfo map;
@@ -48,6 +59,14 @@ static GstFlowReturn new_sample_callback(GstElement *sink, gpointer user_data) {
         gst_buffer_unmap(buffer, &map);
     }
 
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_time).count();
+    std::cout << "Time since last sample: " << duration << " ms" << std::endl;
+    last_time = now;
+
+    std::cout << "PTS: " << GST_BUFFER_PTS(buffer) << std::endl;
+    std::this_thread::sleep_for(std::chrono::milliseconds(33)); // 模拟30FPS
+
+
     gst_sample_unref(sample);
     return GST_FLOW_OK;
 }
@@ -65,6 +84,8 @@ void decode_thread(GstElement *appsrc) {
         // 推送数据到 appsrc
         GstFlowReturn ret;
         g_signal_emit_by_name(appsrc, "push-buffer", buffer, &ret);
+
+        std::cout << "PTS: " << GST_BUFFER_PTS(buffer) << std::endl;
         gst_buffer_unref(buffer);
 
         if (ret != GST_FLOW_OK) {

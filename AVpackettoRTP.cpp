@@ -1,0 +1,526 @@
+#include <netinet/in.h> // htons, htonl
+#include <iostream>
+#include <cstring>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+extern "C" {
+#include <libavutil/opt.h>
+#include <libavcodec/avcodec.h>
+#include <libavutil/imgutils.h>
+#include <libswscale/swscale.h>
+#include <libavutil/pixfmt.h>
+}
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <linux/videodev2.h>
+#include <fstream>
+bool init_udp_socket(const std::string& ip, uint16_t port);
+void close_udp_socket();
+void send_rtp_packets(AVCodecContext* codec_ctx, AVPacket* pkt);
+void send_single_nal(uint8_t* nal, int size);
+void send_fu_a(uint8_t* nal, int size);
+void send_sps_pps(AVCodecContext* codec_ctx);
+void send_udp(uint8_t* packet, size_t packet_size);
+int encodeFrame(AVCodecContext* codec_context, AVFrame* frame);
+
+
+// RTP头（12字节）
+struct RTPHeader {
+  uint8_t cc : 4;      // CSRC计数
+  uint8_t extension : 1;
+  uint8_t padding : 1;
+  uint8_t version : 2; // 固定为2
+  uint8_t pt : 7;      // 负载类型（如96）
+  uint8_t marker : 1;
+  uint16_t seq;        // 序列号
+  uint32_t timestamp;  // 时间戳
+  uint32_t ssrc;       // 同步源标识
+};
+
+// 序列号和时间戳全局变量
+static uint16_t g_sequence = 0;
+static uint32_t g_timestamp = 0;
+
+//UDP套接字全局变量
+int sock = -1;
+sockaddr_in server_addr;
+
+//初始化UDP套接字
+bool init_udp_socket(const std::string& ip, uint16_t port) {
+    sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        std::cerr << "Socket creation failed!" << std::endl;
+        return false;
+    }
+
+    std::memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(port);
+    server_addr.sin_addr.s_addr = inet_addr(ip.c_str());
+    std::cout << "Socket creation succeed, port " <<port<< std::endl;
+
+
+    return true;
+}
+
+// 关闭UDP套接字
+void close_udp_socket() {
+    if (sock >= 0) {
+        close(sock);
+        sock = -1;
+        std::cout << "Socket closed." << std::endl;
+    }
+}
+
+void send_rtp_packets(AVCodecContext* codec_ctx, AVPacket* pkt) {
+  uint8_t* nal_data = pkt->data;
+  int nal_size = pkt->size;
+  uint8_t nal_type = nal_data[0] & 0x1F; // 取NAL类型低5位
+
+  // 强制发送SPS/PPS（关键帧前）
+  if (nal_type == 5) { // IDR帧
+    send_sps_pps(codec_ctx); // 发送SPS/PPS（见后续代码）
+  }
+
+  // 分片或直接发送
+  const int MTU = 1400;
+  if (nal_size <= MTU) {
+    send_single_nal(nal_data, nal_size);
+  } else {
+    send_fu_a(nal_data, nal_size);
+  }
+}
+
+
+void send_single_nal(uint8_t* nal, int size) {
+  // 构造RTP包：RTP头 + NAL数据
+  uint8_t packet[12 + size]; 
+  RTPHeader* header = (RTPHeader*)packet;
+  
+  // 填充RTP头
+  header->version = 2;
+  header->pt = 96;
+  header->seq = htons(g_sequence++);
+  header->timestamp = htonl(g_timestamp);
+  header->ssrc = htonl(0x12345678);
+  header->marker = 1; // 假设一帧一包
+
+  // 复制NAL数据
+  memcpy(packet + 12, nal, size);
+
+  // 发送UDP包（伪代码）
+  send_udp(packet, sizeof(packet));
+}
+
+void send_fu_a(uint8_t* nal, int size) {
+  const int FU_HEADER_SIZE = 2;
+  const int MAX_PAYLOAD = 1400 - 12 - FU_HEADER_SIZE;
+  uint8_t nal_header = nal[0];
+  
+  int offset = 1; // 跳过NAL头
+  int remaining = size - 1;
+  bool is_first = true;
+
+  while (remaining > 0) {
+    int payload_size = std::min(MAX_PAYLOAD, remaining);
+    uint8_t packet[12 + FU_HEADER_SIZE + payload_size];
+    RTPHeader* header = (RTPHeader*)packet;
+
+    // 填充RTP头
+    header->version = 2;
+    header->pt = 96;
+    header->seq = htons(g_sequence++);
+    header->timestamp = htonl(g_timestamp);
+    header->ssrc = htonl(0x12345678);
+    header->marker = (remaining <= payload_size) ? 1 : 0;
+
+    // 构造FU Indicator和FU Header
+    uint8_t fu_indicator = (nal_header & 0xE0) | 28; // FU-A类型为28
+    uint8_t fu_header = 0;
+    if (is_first) {
+      fu_header |= 0x80; // Start位
+    } else if (payload_size >= remaining) {
+      fu_header |= 0x40; // End位
+    }
+    fu_header |= (nal_header & 0x1F); // NAL类型
+
+    // 填充FU头
+    packet[12] = fu_indicator;
+    packet[13] = fu_header;
+
+    // 复制数据
+    memcpy(packet + 14, nal + offset, payload_size);
+
+    // 发送
+    send_udp(packet, sizeof(packet));
+
+    offset += payload_size;
+    remaining -= payload_size;
+    is_first = false;
+  }
+
+  // 更新时间戳（每帧递增）
+  g_timestamp += 90000 / 30; // 假设30fps
+}
+
+void send_sps_pps(AVCodecContext* codec_ctx) {
+  // 从extradata提取SPS/PPS
+  uint8_t* sps = codec_ctx->extradata + 4; // 假设extradata格式为[0,0,0,1, sps...]
+  int sps_len = codec_ctx->extradata[4] == 0x67 ? codec_ctx->extradata[5] << 8 | codec_ctx->extradata[6] : 0;
+  
+  uint8_t* pps = sps + sps_len + 4; // [0,0,0,1, pps...]
+  int pps_len = codec_ctx->extradata_size - (sps_len + 8);
+
+  // 发送SPS
+  send_single_nal(sps - 4, sps_len + 4); // 包含起始码
+
+  // 发送PPS
+  send_single_nal(pps - 4, pps_len + 4);
+}
+
+// send_udp函数：通过UDP发送数据包
+void send_udp(uint8_t* packet, size_t packet_size) {
+    if (sock < 0) {
+        std::cerr << "Socket creation failed!" << std::endl;
+        return;
+    }
+
+    // 发送数据
+    ssize_t sent_len = sendto(sock, packet, packet_size, 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+    if (sent_len < 0) {
+        std::cerr << "Failed to send UDP packet!" << std::endl;
+    } else {
+        std::cout << "Sent " << sent_len << " bytes." << std::endl;
+    }
+
+}
+
+struct Buffer {
+    void* start;
+    size_t length;
+};
+
+void saveFrameAsYUV(AVFrame* out_frame, int width, int height, const char* filename) {
+    std::ofstream outFile(filename, std::ios::binary | std::ios::app);
+    if (!outFile) {
+        std::cerr << "无法打开文件 " << filename << " 进行写入" << std::endl;
+        return;
+    }
+
+    // 写入 Y 平面
+    for (int i = 0; i < height; i++) {
+        // out_frame->data[0] 为 Y 平面的起始地址
+        // 每行写入 width 个字节（假设行内数据前 width 个字节为图像数据）
+        outFile.write(reinterpret_cast<const char*>(out_frame->data[0] + i * out_frame->linesize[0]), width);
+    }
+    // 写入 U 平面
+    for (int i = 0; i < height / 2; i++) {
+        outFile.write(reinterpret_cast<const char*>(out_frame->data[1] + i * out_frame->linesize[1]), width / 2);
+    }
+    // 写入 V 平面
+    for (int i = 0; i < height / 2; i++) {
+        outFile.write(reinterpret_cast<const char*>(out_frame->data[2] + i * out_frame->linesize[2]), width / 2);
+    }
+    outFile.close();
+    std::cout << "已将帧数据保存到 " << filename << std::endl;
+}
+
+// 辅助函数：将一个 AVFrame 编码成 H.264 并写入文件
+int encodeFrame(AVCodecContext* codec_context, AVFrame* frame) {
+    int ret = avcodec_send_frame(codec_context, frame);
+    if (ret < 0) {
+        std::cerr << "Error sending frame for encoding: " << ret << std::endl;
+        return ret;
+    }
+    
+    AVPacket* pkt = av_packet_alloc();
+    if (!pkt) {
+        std::cerr << "Could not allocate packet" << std::endl;
+        return -1;
+    }
+    
+    // 从编码器中读取编码数据包
+    while (ret >= 0) {
+        ret = avcodec_receive_packet(codec_context, pkt);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+            av_packet_free(&pkt);
+            return 0;
+        } else if (ret < 0) {
+            std::cerr << "Error during encoding: " << ret << std::endl;
+            av_packet_free(&pkt);
+            return ret;
+        }
+        // 将编码后的数据写入文件
+        // outfile.write(reinterpret_cast<char*>(pkt->data), pkt->size);
+        // 将编码后的数据打包为RTP
+        send_rtp_packets(codec_context, pkt);
+
+
+
+        av_packet_unref(pkt);
+    }
+    
+    av_packet_free(&pkt);
+    return 0;
+}
+
+
+int main() {
+    // 1. 打开摄像头设备
+    const char* devName = "/dev/video0";
+    int fd = open(devName, O_RDWR);
+    if (fd == -1) {
+        perror("打开设备失败");
+        return 1;
+    }
+
+    // 2. 查询设备能力
+    struct v4l2_capability cap;
+    if (ioctl(fd, VIDIOC_QUERYCAP, &cap) == -1) {
+        perror("查询设备能力失败");
+        close(fd);
+        return 1;
+    }
+    std::cout << "摄像头设备: " << cap.card << std::endl;
+
+    // 3. 设置视频格式（选择 YUYV 格式，分辨率 640x480）
+    struct v4l2_format fmt;
+    memset(&fmt, 0, sizeof(fmt));
+    fmt.type                = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.fmt.pix.width       = 640;
+    fmt.fmt.pix.height      = 480;
+    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV; // YUYV 格式
+    fmt.fmt.pix.field       = V4L2_FIELD_INTERLACED;
+    if (ioctl(fd, VIDIOC_S_FMT, &fmt) == -1) {
+        perror("设置视频格式失败");
+        close(fd);
+        return 1;
+    }
+    std::cout << "视频格式设置为 YUYV 640x480" << std::endl;
+
+    // 4. 请求缓冲区（这里申请 4 个缓冲区）
+    struct v4l2_requestbuffers req;
+    memset(&req, 0, sizeof(req));
+    req.count  = 4;
+    req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    req.memory = V4L2_MEMORY_MMAP;
+    if (ioctl(fd, VIDIOC_REQBUFS, &req) == -1) {
+        perror("请求缓冲区失败");
+        close(fd);
+        return 1;
+    }
+
+    // 5. 映射缓冲区
+    Buffer buffers[4];
+    for (unsigned int i = 0; i < req.count; i++) {
+        struct v4l2_buffer buf;
+        memset(&buf, 0, sizeof(buf));
+        buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index  = i;
+        if (ioctl(fd, VIDIOC_QUERYBUF, &buf) == -1) {
+            perror("查询缓冲区失败");
+            close(fd);
+            return 1;
+        }
+        buffers[i].length = buf.length;
+        buffers[i].start = mmap(nullptr, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, buf.m.offset);
+        if (buffers[i].start == MAP_FAILED) {
+            perror("映射缓冲区失败");
+            close(fd);
+            return 1;
+        }
+    }
+
+    // 6. 将缓冲区入队
+    for (unsigned int i = 0; i < req.count; i++) {
+        struct v4l2_buffer buf;
+        memset(&buf, 0, sizeof(buf));
+        buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index  = i;
+        if (ioctl(fd, VIDIOC_QBUF, &buf) == -1) {
+            perror("缓冲区入队失败");
+            close(fd);
+            return 1;
+        }
+    }
+
+    // 7. 启动视频流
+    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(fd, VIDIOC_STREAMON, &type) == -1) {
+        perror("启动视频流失败");
+        close(fd);
+        return 1;
+    }
+
+    // 8. 初始化 libswscale 转换上下文：将 YUYV422 转为 YUV420P
+    //    注意：V4L2 中 YUYV 格式对应的 FFmpeg 像素格式是 AV_PIX_FMT_YUYV422
+    int width = 640, height = 480;
+    AVPixelFormat in_pix_fmt  = AV_PIX_FMT_YUYV422;
+    AVPixelFormat out_pix_fmt = AV_PIX_FMT_YUV420P;
+    SwsContext* sws_ctx = sws_getContext(width, height,
+                                         in_pix_fmt,
+                                         width, height,
+                                         out_pix_fmt,
+                                         SWS_BILINEAR, nullptr, nullptr, nullptr);
+    if (!sws_ctx) {
+        std::cerr << "无法创建转换上下文" << std::endl;
+        close(fd);
+        return 1;
+    }
+
+    // 分配输出 AVFrame（YUV420P 格式）
+    AVFrame* out_frame = av_frame_alloc();
+    out_frame->width  = width;
+    out_frame->height = height;
+    out_frame->format = out_pix_fmt;
+    int ret = av_image_alloc(out_frame->data, out_frame->linesize, width, height, out_pix_fmt, 1);
+    if (ret < 0) {
+        std::cerr << "无法分配输出帧内存" << std::endl;
+        sws_freeContext(sws_ctx);
+        close(fd);
+        return 1;
+    }
+
+//查找h264编码器
+    const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_H264);
+    if (!codec) {
+        std::cerr << "Codec not found" << std::endl;
+        return -1;
+    }
+
+    //创建编码器上下文
+    AVCodecContext* codec_context = avcodec_alloc_context3(codec);
+    if(!codec_context) {
+        std::cerr << "Could not allocate video codec context!" << std::endl;
+        return -1;
+    }
+
+    //设置编码参数;
+    codec_context->bit_rate = 400000;
+    codec_context->width = 640;
+    codec_context->height = 480;
+    codec_context->time_base = {1, 30};            // 30 fps
+    codec_context->framerate = {30, 1};
+    codec_context->gop_size = 10;                  // 组内关键帧间隔
+    codec_context->max_b_frames = 1;               // 最大 B 帧数
+    codec_context->pix_fmt = AV_PIX_FMT_YUV420P;     // H.264 编码器通常要求输入 YUV420P 格式
+
+    // 可选：设置一些编码选项，比如编码速度和质量
+    av_opt_set(codec_context->priv_data, "preset", "fast", 0);
+
+    //打开编码器
+    if (avcodec_open2(codec_context, codec, NULL) < 0) {
+        std::cerr << "Could not open codec!" << std::endl;
+        return -1;
+    }
+
+    // 打开输出文件，用于写入 H.264 数据
+    // std::ofstream outfile("output.h264", std::ios::binary);
+    // if (!outfile) {
+    //     std::cerr << "Could not open output file" << std::endl;
+    //     return -1;
+    // }
+
+     // 初始化UDP套接字
+    if (!init_udp_socket("127.0.0.1", 12345)) {
+        return 1;
+    }
+    
+    /////////////////////////////////主循环///////////////////////////////////////
+
+    // 9. 进入采集循环（示例采集 100 帧）
+    int i = 0;
+    while (true) {
+        i++;
+        struct v4l2_buffer buf;
+        memset(&buf, 0, sizeof(buf));
+        buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        if (ioctl(fd, VIDIOC_DQBUF, &buf) == -1) {
+            perror("取出缓冲区数据失败");
+            break;
+        }
+
+        // 创建一个输入 AVFrame 用来包装摄像头采集到的数据
+        AVFrame* in_frame = av_frame_alloc();
+        in_frame->width  = width;
+        in_frame->height = height;
+        in_frame->format = in_pix_fmt;
+        // 使用 av_image_fill_arrays 将缓冲区数据填充到 in_frame 中
+        ret = av_image_fill_arrays(in_frame->data, in_frame->linesize,
+                                   static_cast<uint8_t*>(buffers[buf.index].start),
+                                   in_pix_fmt, width, height, 1);
+        if (ret < 0) {
+            std::cerr << "填充输入帧数据失败" << std::endl;
+            av_frame_free(&in_frame);
+            break;
+        }
+
+        // 进行像素格式转换：YUYV422 -> YUV420P
+        sws_scale(sws_ctx, in_frame->data, in_frame->linesize,
+                  0, height, out_frame->data, out_frame->linesize);
+        
+        out_frame->pts = i;
+        if (!out_frame || !out_frame->data[0]) {
+            std::cerr << "输出帧无效或数据为空" << std::endl;
+            av_frame_free(&out_frame);
+            break;
+        }
+        if (codec_context->pix_fmt != out_frame->format) {
+            std::cerr << "像素格式不匹配！" << std::endl;
+            break;
+        }
+        // 此时，out_frame 包含转换后的 YUV420P 数据，可供后续处理或编码使用
+        std::cout << "捕获第 " << i << " 帧，并已转换为 YUV420P" << std::endl;
+
+        // 假设 width = 640, height = 480, out_frame 已经转换为 YUV420P 格式
+        // saveFrameAsYUV(out_frame, 640, 480, "output.yuv");
+
+        // 对当前帧进行编码，并写入到输出文件
+        if (encodeFrame(codec_context, out_frame) < 0) {
+            std::cerr << "Failed to encode frame " << i << std::endl;
+            av_frame_free(&out_frame);
+            break;
+        }
+        std::cout << "Encoded frame " << i << std::endl;
+        // av_frame_free(&out_frame);
+        av_frame_free(&in_frame);
+
+        // 将缓冲区重新入队，以便下次使用
+        if (ioctl(fd, VIDIOC_QBUF, &buf) == -1) {
+            perror("重新入队缓冲区失败");
+            break;
+        }
+    }
+    /////////////////////////////////////////////////////////////////////////
+
+    // 10. 停止视频流
+    if (ioctl(fd, VIDIOC_STREAMOFF, &type) == -1) {
+        perror("停止视频流失败");
+    }
+
+     // 7. 刷新编码器（送入 NULL 帧以获得延迟的包）
+    encodeFrame(codec_context, nullptr);
+
+    // 11. 释放资源
+    sws_freeContext(sws_ctx);
+    av_freep(&out_frame->data[0]);
+    av_frame_free(&out_frame);
+    for (unsigned int i = 0; i < req.count; i++) {
+        munmap(buffers[i].start, buffers[i].length);
+    }
+    close(fd);
+    avcodec_free_context(&codec_context);
+    std::cout << "H.264 编码完成，输出文件为 output.h264" << std::endl;
+
+    // 关闭UDP套接字
+    close_udp_socket();
+    return 0;
+}
