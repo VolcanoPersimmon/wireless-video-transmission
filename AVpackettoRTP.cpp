@@ -99,7 +99,7 @@ void send_rtp_packets(AVCodecContext* codec_ctx, AVPacket* pkt) {
 
 void send_single_nal(uint8_t* nal, int size) {
   // 构造RTP包：RTP头 + NAL数据
-  uint8_t packet[12 + size]; 
+  unsigned char packet[12 + size]; 
   RTPHeader* header = (RTPHeader*)packet;
   
   // 填充RTP头
@@ -128,7 +128,7 @@ void send_fu_a(uint8_t* nal, int size) {
 
   while (remaining > 0) {
     int payload_size = std::min(MAX_PAYLOAD, remaining);
-    uint8_t packet[12 + FU_HEADER_SIZE + payload_size];
+    unsigned char packet[12 + FU_HEADER_SIZE + payload_size];
     RTPHeader* header = (RTPHeader*)packet;
 
     // 填充RTP头
