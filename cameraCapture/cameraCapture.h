@@ -11,6 +11,7 @@
 #include <thread>
 #include <atomic>
 #include <functional>
+#include <mutex>
 
 
 class CameraCapture
