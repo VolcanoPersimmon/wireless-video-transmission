@@ -11,7 +11,7 @@ void CameraCapture::start(FrameCallback callback){
         if (running_) return;
 
         // 初始化设备
-        fd_ = open(devName_, O_RDWR);
+        fd_ = open(devName_.c_str(), O_RDWR);
         if (fd_ == -1) throw std::runtime_error("无法打开摄像头设备");
 
         // 查询设备能力
@@ -50,7 +50,7 @@ void CameraCapture::start(FrameCallback callback){
         if (ioctl(fd_, VIDIOC_STREAMON, nullptr) == -1) throw std::runtime_error("启动视频流失败");
 
         running_ = true;
-        capture_thread_ = std::thread(&CameraCapture::capture_loop, this, std::move(callback));
+        captureThread_ = std::thread(&CameraCapture::captureLoop, this, std::move(callback));
 }
 
 void CameraCapture::stop(){
@@ -58,7 +58,7 @@ void CameraCapture::stop(){
     if (!running_) return;
 
     running_ = false;
-    if (capture_thread_.joinable()) capture_thread_.join();
+    if (captureThread_.joinable()) captureThread_.join();
 
         // 停止视频流
         if (ioctl(fd_, VIDIOC_STREAMOFF, nullptr) == -1) perror("停止视频流失败");
@@ -70,7 +70,7 @@ void CameraCapture::stop(){
         close(fd_);
 }
 
-void CameraCapture::capture_loop(FrameCallback callback){
+void CameraCapture::captureLoop(FrameCallback callback){
     while (running_) {
         struct v4l2_buffer buf;
         memset(&buf, 0, sizeof(buf));

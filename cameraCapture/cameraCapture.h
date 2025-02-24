@@ -12,6 +12,7 @@
 #include <atomic>
 #include <functional>
 #include <mutex>
+#include <sys/mman.h>
 
 
 class CameraCapture
@@ -19,13 +20,13 @@ class CameraCapture
 public:
     using FrameCallback = std::function<void(const std::vector<uint8_t>& frame)>;
 
-    CameraCapture();
+    CameraCapture(int width, int height, const char* devName);
     ~CameraCapture();
 
     void start(FrameCallback callback);
     void stop();
 private:
-    void captureLoop();
+    void captureLoop(FrameCallback callback);
 
     int fd_;
     std::vector<Buffer> buffers_;
@@ -36,12 +37,8 @@ private:
     std::thread captureThread_;
     std::mutex mutex_;
 
-    struct Buffer {
-        void* start;
-        size_t length;
-    };
+    
 };
-
 struct Buffer {
     void* start;
     size_t length;
