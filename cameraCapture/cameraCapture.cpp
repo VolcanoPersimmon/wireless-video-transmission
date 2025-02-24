@@ -1,6 +1,6 @@
 #include "cameraCapture.h"
 
-CameraCapture::CameraCaptrue(int width = 640, int height = 480, const char* devName = "/dev/video0"):width_(width), height_(height), devName_(devName), running_(false){}
+CameraCapture::CameraCaptrue(int width = 640, int height = 480, const char* devName = "/dev/video0") : width_(width), height_(height), devName_(devName), running_(false){}
 
 CameraCapture::~CameraCaptrue(){
     stop();
