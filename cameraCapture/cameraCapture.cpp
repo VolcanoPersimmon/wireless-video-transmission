@@ -1,12 +1,12 @@
-#include "CameraCaptrue.h"
+#include "cameraCapture.h"
 
-CameraCaptrue::CameraCaptrue(int width = 640, int height = 480, const char* devName = "/dev/video0"):width_(width), height_(height), devName_(devName), running_(false){}
+CameraCapture::CameraCaptrue(int width = 640, int height = 480, const char* devName = "/dev/video0"):width_(width), height_(height), devName_(devName), running_(false){}
 
-CameraCaptrue::~CameraCaptrue(){
+CameraCapture::~CameraCaptrue(){
     stop();
 }
 
-void CameraCaptrue::start(FrameCallback callback){
+void CameraCapture::start(FrameCallback callback){
      std::lock_guard<std::mutex> lock(mutex_);
         if (running_) return;
 
@@ -53,7 +53,7 @@ void CameraCaptrue::start(FrameCallback callback){
         capture_thread_ = std::thread(&CameraCapture::capture_loop, this, std::move(callback));
 }
 
-void CameraCaptrue::stop(){
+void CameraCapture::stop(){
     std::lock_guard<std::mutex> lock(mutex_);
     if (!running_) return;
 
