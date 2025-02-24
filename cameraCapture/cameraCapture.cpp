@@ -17,7 +17,8 @@ void CameraCapture::start(FrameCallback callback){
         // 查询设备能力
         struct v4l2_capability cap;
         if (ioctl(fd_, VIDIOC_QUERYCAP, &cap) == -1) throw std::runtime_error("查询设备能力失败");
-        
+        std::cout << "摄像头设备： " << cap.card << std::endl;
+
         // 设置视频格式
         struct v4l2_format fmt;
         memset(&fmt, 0, sizeof(fmt));
@@ -25,7 +26,10 @@ void CameraCapture::start(FrameCallback callback){
         fmt.fmt.pix.width = width_;
         fmt.fmt.pix.height = height_;
         fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+        fmt.fmt.pix.field = V4L2_FIELD_INTERLACED;
         if (ioctl(fd_, VIDIOC_S_FMT, &fmt) == -1) throw std::runtime_error("设置视频格式失败");
+
+        std::cout << "视频格式设置为 YUYV 640x480" << std::endl;
 
         // 请求缓冲区
         struct v4l2_requestbuffers req;
@@ -36,18 +40,41 @@ void CameraCapture::start(FrameCallback callback){
         if (ioctl(fd_, VIDIOC_REQBUFS, &req) == -1) throw std::runtime_error("请求缓冲区失败");
 
         // 映射缓冲区
-        buffers_.resize(4);
-        for (unsigned int i = 0; i < 4; ++i) {
+        for (unsigned int i = 0; i < req.count; ++i) {
             struct v4l2_buffer buf;
             memset(&buf, 0, sizeof(buf));
+            buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            buf.memory = V4L2_MEMORY_MMAP;
             buf.index = i;
             if (ioctl(fd_, VIDIOC_QUERYBUF, &buf) == -1) throw std::runtime_error("查询缓冲区失败");
-            buffers_[i].start = mmap(nullptr, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, buf.m.offset);
+            buffers_[i].length = buf.length;
+            buffers_[i].start = (mmap(nullptr, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, buf.m.offset));
             if (buffers_[i].start == MAP_FAILED) throw std::runtime_error("映射缓冲区失败");
         }
 
+            // 将缓冲区入队
+        for (unsigned int i = 0; i < req.count; i++) {
+            struct v4l2_buffer buf;
+            memset(&buf, 0, sizeof(buf));
+            buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            buf.memory = V4L2_MEMORY_MMAP;
+            buf.index  = i;
+            if (ioctl(fd_, VIDIOC_QBUF, &buf) == -1) {
+                throw std::runtime_error("缓冲区入队失败");
+                
+            }
+        }
+
         // 启动视频流
-        if (ioctl(fd_, VIDIOC_STREAMON, nullptr) == -1) throw std::runtime_error("启动视频流失败");
+        type_ = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        int ret = ioctl(fd_, VIDIOC_STREAMON, &type_);
+        // if (ioctl(fd_, VIDIOC_STREAMON, type) == -1) throw std::runtime_error("启动视频流失败");
+        if (ret == -1) {
+            std::cerr << "VIDIOC_STREAMON failed: " 
+                    << strerror(errno) << " (" << errno << ")" << std::endl;
+            throw std::runtime_error("启动视频流失败");
+        }
+
 
         running_ = true;
         captureThread_ = std::thread(&CameraCapture::captureLoop, this, std::move(callback));
@@ -61,7 +88,7 @@ void CameraCapture::stop(){
     if (captureThread_.joinable()) captureThread_.join();
 
         // 停止视频流
-        if (ioctl(fd_, VIDIOC_STREAMOFF, nullptr) == -1) perror("停止视频流失败");
+        if (ioctl(fd_, VIDIOC_STREAMOFF, &type_) == -1) perror("停止视频流失败");
 
         // 释放缓冲区
         for (auto& buffer : buffers_) {
@@ -81,7 +108,10 @@ void CameraCapture::captureLoop(FrameCallback callback){
             break;
         }
 
-        std::vector<uint8_t> frame(buffers_[buf.index].start, buffers_[buf.index].start + buffers_[buf.index].length);
+        std::vector<uint8_t> frame(
+            static_cast<uint8_t*>(buffers_[buf.index].start),
+            static_cast<uint8_t*>(buffers_[buf.index].start) + buffers_[buf.index].length
+        );
         callback(frame);
 
         // 重新入队缓冲区

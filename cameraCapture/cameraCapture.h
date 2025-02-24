@@ -14,6 +14,10 @@
 #include <mutex>
 #include <sys/mman.h>
 
+struct Buffer {
+    void* start;
+    size_t length;
+};
 
 class CameraCapture
 {
@@ -29,7 +33,8 @@ private:
     void captureLoop(FrameCallback callback);
 
     int fd_;
-    std::vector<Buffer> buffers_;
+    int type_;
+    Buffer buffers_[4];
     std::string devName_;
     int width_;
     int height_;
@@ -39,9 +44,6 @@ private:
 
     
 };
-struct Buffer {
-    void* start;
-    size_t length;
-};
+
 
 #endif //VIDEO_PREPROCESS_H
